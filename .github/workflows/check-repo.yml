@@ -153,11 +153,11 @@ jobs:
               
               print(f"✓ Repository {repo_name} exists")
               
-              # Parse architectures
+              # Parse architectures (excluding i386)
               release_text = release_content.decode('utf-8', errors='ignore')
               arch_match = re.search(r'^Architectures:\s*(.+)$', release_text, re.MULTILINE)
               if arch_match:
-                  architectures = [arch.strip() for arch in arch_match.group(1).split() if arch.strip() != 'source']
+                  architectures = [arch.strip() for arch in arch_match.group(1).split() if arch.strip() not in ['source', 'i386']]
               else:
                   architectures = []
               
@@ -230,7 +230,7 @@ jobs:
               def get_architectures(release_content):
                   text = release_content.decode('utf-8', errors='ignore')
                   arch_match = re.search(r'^Architectures:\s*(.+)$', text, re.MULTILINE)
-                  return [arch.strip() for arch in arch_match.group(1).split() if arch.strip() != 'source'] if arch_match else []
+                  return [arch.strip() for arch in arch_match.group(1).split() if arch.strip() not in ['source', 'i386']] if arch_match else []
               
               archs1 = get_architectures(release1)
               archs2 = get_architectures(release2)
@@ -262,13 +262,6 @@ jobs:
                   if ver1 != ver2:
                       differences.append(f"{pkg}|source|{ver1}|{ver2}")
               
-              # If sources differ, check if we should continue (for i386/amd64 compatibility)
-              sources_differ = len([d for d in differences if d.endswith('source')]) > 0
-              
-              # Special handling for grml repos: allow i386 to match amd64
-              # This applies to grml-stable, grml-testing, and versioned repos like grml-2025.08
-              is_grml_repo = any(name.startswith('grml-') for name in [repo1_name, repo2_name])
-              
               def get_binary_packages_detailed(base_url, arch):
                   content = fetch_url(f"{base_url}/main/binary-{arch}/Packages.gz")
                   if content:
@@ -280,49 +273,8 @@ jobs:
                       content = fetch_url(f"{base_url}/main/binary-{arch}/Packages")
                   return get_package_details(content)
               
-              # Check i386/amd64 compatibility first for grml repos
-              skip_archs = set()
-              repos_are_compatible = False
-              if is_grml_repo:
-                  repo1_has_i386 = 'i386' in archs1
-                  repo1_has_amd64 = 'amd64' in archs1
-                  repo2_has_i386 = 'i386' in archs2
-                  repo2_has_amd64 = 'amd64' in archs2
-                  
-                  if 'i386' in all_archs and 'amd64' in all_archs:
-                      # Get detailed packages for compatibility check
-                      repo1_i386 = get_binary_packages_detailed(base_url1, 'i386') if repo1_has_i386 else {}
-                      repo1_amd64 = get_binary_packages_detailed(base_url1, 'amd64') if repo1_has_amd64 else {}
-                      repo2_i386 = get_binary_packages_detailed(base_url2, 'i386') if repo2_has_i386 else {}
-                      repo2_amd64 = get_binary_packages_detailed(base_url2, 'amd64') if repo2_has_amd64 else {}
-                      
-                      # Check compatibility scenarios
-                      compatible = False
-                      if repo1_has_i386 and repo1_has_amd64 and repo2_has_i386 and repo2_has_amd64:
-                          if repo1_i386 == repo1_amd64 and repo2_i386 == repo2_amd64 and repo1_amd64 == repo2_amd64:
-                              compatible = True
-                      elif repo1_has_i386 and repo1_has_amd64 and repo2_has_amd64 and not repo2_has_i386:
-                          if repo1_i386 == repo1_amd64 == repo2_amd64:
-                              compatible = True
-                      elif repo1_has_i386 and repo1_has_amd64 and repo2_has_i386 and not repo2_has_amd64:
-                          if repo1_i386 == repo1_amd64 == repo2_i386:
-                              compatible = True
-                      elif repo2_has_i386 and repo2_has_amd64 and repo1_has_amd64 and not repo1_has_i386:
-                          if repo2_i386 == repo2_amd64 == repo1_amd64:
-                              compatible = True
-                      elif repo2_has_i386 and repo2_has_amd64 and repo1_has_i386 and not repo1_has_amd64:
-                          if repo2_i386 == repo2_amd64 == repo1_i386:
-                              compatible = True
-                      
-                      if compatible:
-                          skip_archs.update(['i386', 'amd64'])
-                          repos_are_compatible = True
-              
               # Compare binary packages for each architecture
               for arch in all_archs:
-                  if arch in skip_archs:
-                      continue
-                      
                   packages1 = get_binary_packages_detailed(base_url1, arch)
                   packages2 = get_binary_packages_detailed(base_url2, arch)
                   
@@ -333,10 +285,6 @@ jobs:
                       ver2 = packages2.get(pkg, "MISSING")
                       if ver1 != ver2:
                           differences.append(f"{pkg}|{arch}|{ver1}|{ver2}")
-              
-              # Return result - if repos are compatible, consider as MATCH even if there were differences
-              if repos_are_compatible:
-                  return f"MATCH:{repo1_name}:{repo2_name}"
               
               if differences:
                   # Format differences for detailed output
