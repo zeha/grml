@@ -1,0 +1,810 @@
+name: Check Repository
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  check-repo:
+    if: github.event.issue.state == 'open' && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) && (startsWith(github.event.comment.body, '/check-repo-pre') || contains(github.event.comment.body, '\n/check-repo-pre') || startsWith(github.event.comment.body, '/check-repo-released') || contains(github.event.comment.body, '\n/check-repo-released'))
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Determine check type
+        id: check-type
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentBody = context.payload.comment.body;
+            const isPreRelease = commentBody.includes('/check-repo-pre');
+            const isPostRelease = commentBody.includes('/check-repo-released');
+            
+            if (isPreRelease) {
+              core.setOutput('type', 'pre');
+              core.setOutput('title', 'Pre-Release Repository Check');
+              core.setOutput('icon', '🔍');
+            } else if (isPostRelease) {
+              core.setOutput('type', 'post');
+              core.setOutput('title', 'Post-Release Repository Check');
+              core.setOutput('icon', '🚀');
+            } else {
+              core.setFailed('Unable to determine check type from comment');
+            }
+
+      - name: Post initial status comment
+        id: initial-comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const checkTitle = '${{ steps.check-type.outputs.title }}';
+            const checkIcon = '${{ steps.check-type.outputs.icon }}';
+            
+            const comment = await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🔄 **${checkTitle} In Progress**\n\nStarting repository validation checks...\n\n*This comment will be updated with results when the check completes.*`
+            });
+            core.setOutput('comment_id', comment.data.id);
+
+      - name: Extract version from issue
+        id: extract-version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueBody = context.payload.issue.body;
+            const issueTitle = context.payload.issue.title;
+
+            // Try to extract current version from title first (format: "Release YYYY.MM")
+            let versionMatch = issueTitle.match(/Release\s+(\d{4}\.\d{2})/i);
+            if (!versionMatch) {
+              // Try to extract from body
+              versionMatch = issueBody.match(/(?:decide:\s*release\s+datename|release)[:\s]+(\d{4}\.\d{2})/i);
+            }
+
+            if (!versionMatch) {
+              core.setFailed('Could not extract version number from issue title or body');
+              return;
+            }
+
+            const version = versionMatch[1];
+            core.setOutput('version', version);
+
+            // Extract previous version from issue body
+            const prevVersionMatch = issueBody.match(/previous\s+release\s+datename[:\s]+`?(\d{4}\.\d{2})`?/i);
+            if (!prevVersionMatch) {
+              core.setFailed('Could not extract previous version from issue body');
+              return;
+            }
+
+            const prevVersion = prevVersionMatch[1];
+            core.setOutput('prev_version', prevVersion);
+
+            console.log(`Extracted version: ${version}`);
+            console.log(`Previous version: ${prevVersion}`);
+
+      - name: Check repositories
+        id: check-repos
+        run: |
+          python3 << 'EOF'
+          import urllib.request
+          import urllib.error
+          import gzip
+          import json
+          import re
+          import sys
+          import os
+
+          VERSION = "${{ steps.extract-version.outputs.version }}"
+          PREV_VERSION = "${{ steps.extract-version.outputs.prev_version }}"
+          CHECK_TYPE = "${{ steps.check-type.outputs.type }}"
+
+          print(f"Checking repositories for version {VERSION} (previous: {PREV_VERSION}) - {CHECK_TYPE} release check")
+
+          def fetch_url(url):
+              """Fetch URL content, return None if not found"""
+              try:
+                  with urllib.request.urlopen(url) as response:
+                      return response.read()
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  raise
+              except Exception:
+                  return None
+
+          def count_packages(content):
+              """Count packages in a Packages or Sources file"""
+              if content is None:
+                  return 0
+              text = content.decode('utf-8', errors='ignore')
+              return len(re.findall(r'^Package:', text, re.MULTILINE))
+
+          def get_package_versions(content):
+              """Get package name:version pairs"""
+              if content is None:
+                  return set()
+              text = content.decode('utf-8', errors='ignore')
+              packages = {}
+              current_package = None
+              
+              for line in text.split('\n'):
+                  if line.startswith('Package: '):
+                      current_package = line[9:].strip()
+                  elif line.startswith('Version: ') and current_package:
+                      version = line[9:].strip()
+                      packages[current_package] = version
+                      current_package = None
+              
+              return set(f"{pkg}:{ver}" for pkg, ver in packages.items())
+
+          def check_repo(base_url, repo_name):
+              """Check repository and return stats"""
+              print(f"Checking {repo_name} at {base_url}")
+              
+              # Check Release file
+              release_content = fetch_url(f"{base_url}/Release")
+              if release_content is None:
+                  print(f"✗ Repository {repo_name} does not exist")
+                  return f"{repo_name}:MISSING:0:0:none:none"
+              
+              print(f"✓ Repository {repo_name} exists")
+              
+              # Parse architectures
+              release_text = release_content.decode('utf-8', errors='ignore')
+              arch_match = re.search(r'^Architectures:\s*(.+)$', release_text, re.MULTILINE)
+              if arch_match:
+                  architectures = [arch.strip() for arch in arch_match.group(1).split() if arch.strip() != 'source']
+              else:
+                  architectures = []
+              
+              # Count source packages
+              sources_content = fetch_url(f"{base_url}/main/source/Sources.gz")
+              if sources_content:
+                  try:
+                      sources_content = gzip.decompress(sources_content)
+                  except:
+                      pass
+              else:
+                  sources_content = fetch_url(f"{base_url}/main/source/Sources")
+              
+              sources_count = count_packages(sources_content)
+              
+              # Count binary packages per architecture
+              total_packages = 0
+              arch_details = []
+              
+              for arch in architectures:
+                  # Try compressed first
+                  packages_content = fetch_url(f"{base_url}/main/binary-{arch}/Packages.gz")
+                  if packages_content:
+                      try:
+                          packages_content = gzip.decompress(packages_content)
+                      except:
+                          pass
+                  else:
+                      packages_content = fetch_url(f"{base_url}/main/binary-{arch}/Packages")
+                  
+                  arch_packages = count_packages(packages_content)
+                  total_packages += arch_packages
+                  arch_details.append(f"{arch}:{arch_packages}")
+              
+              architectures_str = ','.join(architectures) if architectures else 'none'
+              arch_details_str = ','.join(arch_details) if arch_details else 'none'
+              
+              return f"{repo_name}:EXISTS:{total_packages}:{sources_count}:{architectures_str}:{arch_details_str}"
+
+          def get_package_details(content):
+              """Get detailed package info with name and version separated"""
+              if content is None:
+                  return {}
+              text = content.decode('utf-8', errors='ignore')
+              packages = {}
+              current_package = None
+              
+              for line in text.split('\n'):
+                  if line.startswith('Package: '):
+                      current_package = line[9:].strip()
+                  elif line.startswith('Version: ') and current_package:
+                      version = line[9:].strip()
+                      packages[current_package] = version
+                      current_package = None
+              
+              return packages
+
+          def compare_repos(base_url1, base_url2, repo1_name, repo2_name):
+              """Compare two repositories for exact package matches"""
+              print(f"Comparing {repo1_name} with {repo2_name}")
+              
+              # Get architectures from both repos
+              release1 = fetch_url(f"{base_url1}/Release")
+              release2 = fetch_url(f"{base_url2}/Release")
+              
+              if not release1 or not release2:
+                  return f"DIFF:{repo1_name}:{repo2_name}:missing_release_file"
+              
+              def get_architectures(release_content):
+                  text = release_content.decode('utf-8', errors='ignore')
+                  arch_match = re.search(r'^Architectures:\s*(.+)$', text, re.MULTILINE)
+                  return [arch.strip() for arch in arch_match.group(1).split() if arch.strip() != 'source'] if arch_match else []
+              
+              archs1 = get_architectures(release1)
+              archs2 = get_architectures(release2)
+              all_archs = set(archs1 + archs2)
+              
+              # Collect all package differences
+              differences = []
+              
+              # Compare sources
+              def get_source_packages_detailed(base_url):
+                  content = fetch_url(f"{base_url}/main/source/Sources.gz")
+                  if content:
+                      try:
+                          content = gzip.decompress(content)
+                      except:
+                          pass
+                  else:
+                      content = fetch_url(f"{base_url}/main/source/Sources")
+                  return get_package_details(content)
+              
+              sources1 = get_source_packages_detailed(base_url1)
+              sources2 = get_source_packages_detailed(base_url2)
+              
+              # Find source package differences
+              all_source_packages = set(sources1.keys()) | set(sources2.keys())
+              for pkg in all_source_packages:
+                  ver1 = sources1.get(pkg, "MISSING")
+                  ver2 = sources2.get(pkg, "MISSING")
+                  if ver1 != ver2:
+                      differences.append(f"{pkg}|source|{ver1}|{ver2}")
+              
+              # If sources differ, check if we should continue (for i386/amd64 compatibility)
+              sources_differ = len([d for d in differences if d.endswith('source')]) > 0
+              
+              # Special handling for grml-stable and grml-testing: allow i386 to match amd64
+              is_stable_testing = ('grml-stable' in [repo1_name, repo2_name] or 'grml-testing' in [repo1_name, repo2_name])
+              
+              def get_binary_packages_detailed(base_url, arch):
+                  content = fetch_url(f"{base_url}/main/binary-{arch}/Packages.gz")
+                  if content:
+                      try:
+                          content = gzip.decompress(content)
+                      except:
+                          pass
+                  else:
+                      content = fetch_url(f"{base_url}/main/binary-{arch}/Packages")
+                  return get_package_details(content)
+              
+              # Check i386/amd64 compatibility first for stable/testing repos
+              skip_archs = set()
+              if is_stable_testing:
+                  repo1_has_i386 = 'i386' in archs1
+                  repo1_has_amd64 = 'amd64' in archs1  
+                  repo2_has_i386 = 'i386' in archs2
+                  repo2_has_amd64 = 'amd64' in archs2
+                  
+                  if 'i386' in all_archs and 'amd64' in all_archs:
+                      # Get detailed packages for compatibility check
+                      repo1_i386 = get_binary_packages_detailed(base_url1, 'i386') if repo1_has_i386 else {}
+                      repo1_amd64 = get_binary_packages_detailed(base_url1, 'amd64') if repo1_has_amd64 else {}
+                      repo2_i386 = get_binary_packages_detailed(base_url2, 'i386') if repo2_has_i386 else {}
+                      repo2_amd64 = get_binary_packages_detailed(base_url2, 'amd64') if repo2_has_amd64 else {}
+                      
+                      # Check compatibility scenarios
+                      compatible = False
+                      if repo1_has_i386 and repo1_has_amd64 and repo2_has_i386 and repo2_has_amd64:
+                          if repo1_i386 == repo1_amd64 and repo2_i386 == repo2_amd64 and repo1_amd64 == repo2_amd64:
+                              compatible = True
+                      elif repo1_has_i386 and repo1_has_amd64 and repo2_has_amd64 and not repo2_has_i386:
+                          if repo1_i386 == repo1_amd64 == repo2_amd64:
+                              compatible = True
+                      elif repo1_has_i386 and repo1_has_amd64 and repo2_has_i386 and not repo2_has_amd64:
+                          if repo1_i386 == repo1_amd64 == repo2_i386:
+                              compatible = True
+                      elif repo2_has_i386 and repo2_has_amd64 and repo1_has_amd64 and not repo1_has_i386:
+                          if repo2_i386 == repo2_amd64 == repo1_amd64:
+                              compatible = True
+                      elif repo2_has_i386 and repo2_has_amd64 and repo1_has_i386 and not repo1_has_amd64:
+                          if repo2_i386 == repo2_amd64 == repo1_i386:
+                              compatible = True
+                      
+                      if compatible:
+                          skip_archs.update(['i386', 'amd64'])
+              
+              # Compare binary packages for each architecture
+              for arch in all_archs:
+                  if arch in skip_archs:
+                      continue
+                      
+                  packages1 = get_binary_packages_detailed(base_url1, arch)
+                  packages2 = get_binary_packages_detailed(base_url2, arch)
+                  
+                  # Find package differences for this architecture
+                  all_packages = set(packages1.keys()) | set(packages2.keys())
+                  for pkg in all_packages:
+                      ver1 = packages1.get(pkg, "MISSING")
+                      ver2 = packages2.get(pkg, "MISSING")
+                      if ver1 != ver2:
+                          differences.append(f"{pkg}|{arch}|{ver1}|{ver2}")
+              
+              # Return result
+              if differences:
+                  # Format differences for detailed output
+                  diff_data = []
+                  for diff in differences:
+                      parts = diff.split('|')
+                      diff_data.append({
+                          'package': parts[0],
+                          'arch': parts[1], 
+                          'version1': parts[2],
+                          'version2': parts[3]
+                      })
+                  
+                  # Encode differences as base64 to avoid issues with special characters
+                  import base64
+                  import json
+                  diff_json = json.dumps(diff_data)
+                  diff_encoded = base64.b64encode(diff_json.encode()).decode()
+                  return f"DIFF:{repo1_name}:{repo2_name}:DETAILS:{diff_encoded}"
+              
+              return f"MATCH:{repo1_name}:{repo2_name}"
+
+          # Perform checks based on type
+          results = []
+
+          if CHECK_TYPE == "pre":
+              # Pre-release checks
+              # Check 1: grml-live repository should be empty
+              results.append(check_repo("https://deb.grml.org/dists/grml-live", "grml-live"))
+
+              # Check 2: grml-live-<version> repository should exist and be empty
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-live-{VERSION}", f"grml-live-{VERSION}"))
+
+              # Check 3: grml-<version> repository should exist and match grml-testing
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-{VERSION}", f"grml-{VERSION}"))
+              results.append(check_repo("https://deb.grml.org/dists/grml-testing", "grml-testing"))
+              results.append(compare_repos(f"https://deb.grml.org/dists/grml-{VERSION}", "https://deb.grml.org/dists/grml-testing", f"grml-{VERSION}", "grml-testing"))
+
+              # Check 4: grml-<previous-version>-updates repository should exist
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-{PREV_VERSION}-updates", f"grml-{PREV_VERSION}-updates"))
+
+              # Check 5: grml-stable should match grml-<previous-version>
+              results.append(check_repo("https://deb.grml.org/dists/grml-stable", "grml-stable"))
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-{PREV_VERSION}", f"grml-{PREV_VERSION}"))
+              results.append(compare_repos("https://deb.grml.org/dists/grml-stable", f"https://deb.grml.org/dists/grml-{PREV_VERSION}", "grml-stable", f"grml-{PREV_VERSION}"))
+
+          else:  # POST_RELEASE
+              # Post-release checks
+              # Check 1: grml-live repository should exist
+              results.append(check_repo("https://deb.grml.org/dists/grml-live", "grml-live"))
+
+              # Check 2: grml-live-<version> should exist and match grml-live
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-live-{VERSION}", f"grml-live-{VERSION}"))
+              results.append(compare_repos(f"https://deb.grml.org/dists/grml-live-{VERSION}", "https://deb.grml.org/dists/grml-live", f"grml-live-{VERSION}", "grml-live"))
+
+              # Check 3: grml-<version> should match grml-testing and grml-stable
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-{VERSION}", f"grml-{VERSION}"))
+              results.append(check_repo("https://deb.grml.org/dists/grml-testing", "grml-testing"))
+              results.append(check_repo("https://deb.grml.org/dists/grml-stable", "grml-stable"))
+              results.append(compare_repos(f"https://deb.grml.org/dists/grml-{VERSION}", "https://deb.grml.org/dists/grml-testing", f"grml-{VERSION}", "grml-testing"))
+              results.append(compare_repos(f"https://deb.grml.org/dists/grml-{VERSION}", "https://deb.grml.org/dists/grml-stable", f"grml-{VERSION}", "grml-stable"))
+
+              # Check 4: grml-<previous-version>-updates should exist
+              results.append(check_repo(f"https://deb.grml.org/dists/grml-{PREV_VERSION}-updates", f"grml-{PREV_VERSION}-updates"))
+
+          # Save results
+          with open('/tmp/check_results.txt', 'w') as f:
+              for result in results:
+                  f.write(result + '\n')
+
+          # Print results for debugging
+          for result in results:
+              print(result)
+          EOF
+
+      - name: Update comment with results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Check if workflow failed
+            if ('${{ job.status }}' !== 'success') {
+              const checkTitle = '${{ steps.check-type.outputs.title }}';
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: '${{ steps.initial-comment.outputs.comment_id }}',
+                body: `❌ **${checkTitle} Failed**\n\nThe repository check encountered an error and could not complete.\n\nPlease check the [workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId}) for details.\n\n---\n*Check triggered by @${context.actor}*`
+              });
+              return;
+            }
+
+            const version = '${{ steps.extract-version.outputs.version }}';
+            const prevVersion = '${{ steps.extract-version.outputs.prev_version }}';
+            const checkType = '${{ steps.check-type.outputs.type }}';
+            const checkIcon = '${{ steps.check-type.outputs.icon }}';
+            const checkTitle = '${{ steps.check-type.outputs.title }}';
+
+            // Read results
+            const results = fs.readFileSync('/tmp/check_results.txt', 'utf8').trim().split('\n').filter(line => line.trim());
+
+            let comment = `## ${checkIcon} ${checkTitle} Results\n\n`;
+            comment += `**Version:** ${version} (Previous: ${prevVersion})\n\n`;
+
+            let allPassed = true;
+            let issues = [];
+
+            // Parse results
+            const repoStatus = {};
+            const comparisons = [];
+
+            for (const line of results) {
+              if (line.includes(':EXISTS:') || line.includes(':MISSING:')) {
+                const parts = line.split(':');
+                const [repo, status, packages, sources, architectures, archDetails] = parts;
+                repoStatus[repo] = {
+                  status,
+                  packages: parseInt(packages),
+                  sources: parseInt(sources),
+                  architectures: architectures || 'none',
+                  archDetails: archDetails || 'none'
+                };
+              } else if (line.includes('MATCH:') || line.includes('DIFF:')) {
+                const parts = line.split(':');
+                const status = parts[0];
+                const repo1 = parts[1];
+                const repo2 = parts[2];
+                const details = parts.slice(3).join(':') || '';
+                
+                // Parse detailed differences if available
+                let packageDiffs = null;
+                if (details.startsWith('DETAILS:')) {
+                  try {
+                    const encodedData = details.substring(8); // Remove 'DETAILS:'
+                    const decodedData = atob(encodedData);
+                    packageDiffs = JSON.parse(decodedData);
+                  } catch (e) {
+                    console.log('Failed to parse package differences:', e);
+                  }
+                }
+                
+                comparisons.push({ status, repo1, repo2, details, packageDiffs });
+              }
+            }
+
+            if (checkType === 'pre') {
+              // Pre-release check results
+              // Check 1: grml-live should be empty
+              comment += `### 1. grml-live repository\n`;
+              if (repoStatus['grml-live']?.status === 'EXISTS') {
+                const repo = repoStatus['grml-live'];
+                comment += `**Architectures checked**: ${repo.architectures}\n`;
+                if (repo.archDetails !== 'none') {
+                  comment += `**Per-architecture packages**: ${repo.archDetails}\n`;
+                }
+                if (repo.packages === 0 && repo.sources === 0) {
+                  comment += `✅ **PASS**: grml-live repository exists and is empty\n`;
+                } else {
+                  comment += `❌ **FAIL**: grml-live repository exists but contains packages (${repo.packages} binary, ${repo.sources} source)\n`;
+                  allPassed = false;
+                  issues.push('grml-live repository should be empty');
+                }
+              } else {
+                comment += `❌ **FAIL**: grml-live repository does not exist\n`;
+                allPassed = false;
+                issues.push('grml-live repository is missing');
+              }
+
+              // Check 2: grml-live-<version> should exist and be empty
+              comment += `\n### 2. grml-live-${version} repository\n`;
+              if (repoStatus[`grml-live-${version}`]?.status === 'EXISTS') {
+                const repo = repoStatus[`grml-live-${version}`];
+                comment += `**Architectures checked**: ${repo.architectures}\n`;
+                if (repo.archDetails !== 'none') {
+                  comment += `**Per-architecture packages**: ${repo.archDetails}\n`;
+                }
+                if (repo.packages === 0 && repo.sources === 0) {
+                  comment += `✅ **PASS**: grml-live-${version} repository exists and is empty\n`;
+                } else {
+                  comment += `❌ **FAIL**: grml-live-${version} repository exists but contains packages (${repo.packages} binary, ${repo.sources} source)\n`;
+                  allPassed = false;
+                  issues.push(`grml-live-${version} repository should be empty`);
+                }
+              } else {
+                comment += `❌ **FAIL**: grml-live-${version} repository does not exist\n`;
+                allPassed = false;
+                issues.push(`grml-live-${version} repository is missing`);
+              }
+
+              // Check 3: grml-<version> should match grml-testing
+              comment += `\n### 3. grml-${version} vs grml-testing\n`;
+              const versionTestingMatch = comparisons.find(c => c.repo1 === `grml-${version}` && c.repo2 === 'grml-testing');
+              if (repoStatus[`grml-${version}`]?.status === 'EXISTS' && repoStatus['grml-testing']?.status === 'EXISTS') {
+                const versionRepo = repoStatus[`grml-${version}`];
+                const testingRepo = repoStatus['grml-testing'];
+                comment += `**${version} architectures**: ${versionRepo.architectures}\n`;
+                comment += `**grml-testing architectures**: ${testingRepo.architectures}\n`;
+                if (versionTestingMatch?.status === 'MATCH') {
+                  comment += `✅ **PASS**: grml-${version} matches grml-testing (${versionRepo.packages} packages each)\n`;
+                } else {
+                  comment += `❌ **FAIL**: grml-${version} does not match grml-testing\n`;
+                  
+                  // Add detailed package differences table if available
+                  if (versionTestingMatch?.packageDiffs && versionTestingMatch.packageDiffs.length > 0) {
+                    comment += `\n**Package Differences:**\n`;
+                    comment += `| Package | Architecture | ${version} Version | grml-testing Version |\n`;
+                    comment += `|---------|--------------|-------------------|---------------------|\n`;
+                    
+                    for (const diff of versionTestingMatch.packageDiffs.slice(0, 20)) { // Limit to 20 entries
+                      const pkg = diff.package;
+                      const arch = diff.arch;
+                      const ver1 = diff.version1 === 'MISSING' ? '❌ Missing' : diff.version1;
+                      const ver2 = diff.version2 === 'MISSING' ? '❌ Missing' : diff.version2;
+                      comment += `| ${pkg} | ${arch} | ${ver1} | ${ver2} |\n`;
+                    }
+                    
+                    if (versionTestingMatch.packageDiffs.length > 20) {
+                      comment += `\n*... and ${versionTestingMatch.packageDiffs.length - 20} more differences*\n`;
+                    }
+                    comment += `\n`;
+                  } else if (versionTestingMatch?.details && !versionTestingMatch.details.startsWith('DETAILS:')) {
+                    comment += `(${versionTestingMatch.details.replace(/_/g, ' ')})\n`;
+                  }
+                  
+                  allPassed = false;
+                  issues.push(`grml-${version} and grml-testing have different package contents`);
+                }
+              } else {
+                if (repoStatus[`grml-${version}`]?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-${version} repository does not exist\n`;
+                  allPassed = false;
+                  issues.push(`grml-${version} repository is missing`);
+                }
+                if (repoStatus['grml-testing']?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-testing repository does not exist\n`;
+                  allPassed = false;
+                  issues.push('grml-testing repository is missing');
+                }
+              }
+
+              // Check 4: grml-<previous-version>-updates should exist
+              comment += `\n### 4. grml-${prevVersion}-updates repository\n`;
+              if (repoStatus[`grml-${prevVersion}-updates`]?.status === 'EXISTS') {
+                const repo = repoStatus[`grml-${prevVersion}-updates`];
+                comment += `**Architectures checked**: ${repo.architectures}\n`;
+                comment += `✅ **PASS**: grml-${prevVersion}-updates repository exists (${repo.packages} binary, ${repo.sources} source packages)\n`;
+              } else {
+                comment += `❌ **FAIL**: grml-${prevVersion}-updates repository does not exist\n`;
+                allPassed = false;
+                issues.push(`grml-${prevVersion}-updates repository is missing`);
+              }
+
+              // Check 5: grml-stable should match grml-<previous-version>
+              comment += `\n### 5. grml-stable vs grml-${prevVersion}\n`;
+              const stablePrevMatch = comparisons.find(c => c.repo1 === 'grml-stable' && c.repo2 === `grml-${prevVersion}`);
+              if (repoStatus['grml-stable']?.status === 'EXISTS' && repoStatus[`grml-${prevVersion}`]?.status === 'EXISTS') {
+                const stableRepo = repoStatus['grml-stable'];
+                const prevRepo = repoStatus[`grml-${prevVersion}`];
+                comment += `**grml-stable architectures**: ${stableRepo.architectures}\n`;
+                comment += `**grml-${prevVersion} architectures**: ${prevRepo.architectures}\n`;
+                if (stablePrevMatch?.status === 'MATCH') {
+                  comment += `✅ **PASS**: grml-stable matches grml-${prevVersion} (${stableRepo.packages} packages each)\n`;
+                } else {
+                  comment += `❌ **FAIL**: grml-stable does not match grml-${prevVersion}\n`;
+                  
+                  // Add detailed package differences table if available
+                  if (stablePrevMatch?.packageDiffs && stablePrevMatch.packageDiffs.length > 0) {
+                    comment += `\n**Package Differences:**\n`;
+                    comment += `| Package | Architecture | grml-stable Version | grml-${prevVersion} Version |\n`;
+                    comment += `|---------|--------------|-------------------|--------------------------|\n`;
+                    
+                    for (const diff of stablePrevMatch.packageDiffs.slice(0, 20)) { // Limit to 20 entries
+                      const pkg = diff.package;
+                      const arch = diff.arch;
+                      const ver1 = diff.version1 === 'MISSING' ? '❌ Missing' : diff.version1;
+                      const ver2 = diff.version2 === 'MISSING' ? '❌ Missing' : diff.version2;
+                      comment += `| ${pkg} | ${arch} | ${ver1} | ${ver2} |\n`;
+                    }
+                    
+                    if (stablePrevMatch.packageDiffs.length > 20) {
+                      comment += `\n*... and ${stablePrevMatch.packageDiffs.length - 20} more differences*\n`;
+                    }
+                    comment += `\n`;
+                  } else if (stablePrevMatch?.details && !stablePrevMatch.details.startsWith('DETAILS:')) {
+                    comment += `(${stablePrevMatch.details.replace(/_/g, ' ')})\n`;
+                  }
+                  
+                  allPassed = false;
+                  issues.push(`grml-stable and grml-${prevVersion} have different package contents`);
+                }
+              } else {
+                if (repoStatus['grml-stable']?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-stable repository does not exist\n`;
+                  allPassed = false;
+                  issues.push('grml-stable repository is missing');
+                }
+                if (repoStatus[`grml-${prevVersion}`]?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-${prevVersion} repository does not exist\n`;
+                  allPassed = false;
+                  issues.push(`grml-${prevVersion} repository is missing`);
+                }
+              }
+
+              // Summary
+              comment += `\n### Summary\n`;
+              if (allPassed) {
+                comment += `🎉 **All checks passed!** The repositories are ready for release ${version}.\n`;
+              } else {
+                comment += `⚠️ **${issues.length} issue(s) found:**\n`;
+                for (const issue of issues) {
+                  comment += `- ${issue}\n`;
+                }
+              }
+            } else {
+              // Post-release check results
+              // Check 1: grml-live should exist
+              comment += `### 1. grml-live repository\n`;
+              if (repoStatus['grml-live']?.status === 'EXISTS') {
+                const repo = repoStatus['grml-live'];
+                comment += `**Architectures checked**: ${repo.architectures}\n`;
+                if (repo.archDetails !== 'none') {
+                  comment += `**Per-architecture packages**: ${repo.archDetails}\n`;
+                }
+                comment += `✅ **PASS**: grml-live repository exists (${repo.packages} binary, ${repo.sources} source packages)\n`;
+              } else {
+                comment += `❌ **FAIL**: grml-live repository does not exist\n`;
+                allPassed = false;
+                issues.push('grml-live repository is missing');
+              }
+
+              // Check 2: grml-live-<version> should match grml-live
+              comment += `\n### 2. grml-live-${version} vs grml-live\n`;
+              const liveVersionMatch = comparisons.find(c => c.repo1 === `grml-live-${version}` && c.repo2 === 'grml-live');
+              if (repoStatus[`grml-live-${version}`]?.status === 'EXISTS' && repoStatus['grml-live']?.status === 'EXISTS') {
+                if (liveVersionMatch?.status === 'MATCH') {
+                  comment += `✅ **PASS**: grml-live-${version} matches grml-live (${repoStatus[`grml-live-${version}`].packages} packages each)\n`;
+                } else {
+                  let failMessage = `❌ **FAIL**: grml-live-${version} does not match grml-live`;
+                  if (liveVersionMatch?.details) {
+                    failMessage += ` (${liveVersionMatch.details.replace(/_/g, ' ')})`;
+                  }
+                  comment += failMessage + `\n`;
+                  allPassed = false;
+                  issues.push(`grml-live-${version} and grml-live have different package contents`);
+                }
+              } else {
+                if (repoStatus[`grml-live-${version}`]?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-live-${version} repository does not exist\n`;
+                  allPassed = false;
+                  issues.push(`grml-live-${version} repository is missing`);
+                }
+                if (repoStatus['grml-live']?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-live repository does not exist\n`;
+                  allPassed = false;
+                  issues.push('grml-live repository is missing');
+                }
+              }
+
+              // Check 3: grml-<version> should match grml-testing and grml-stable
+              comment += `\n### 3. grml-${version} vs grml-testing and grml-stable\n`;
+              const versionTestingMatch = comparisons.find(c => c.repo1 === `grml-${version}` && c.repo2 === 'grml-testing');
+              const versionStableMatch = comparisons.find(c => c.repo1 === `grml-${version}` && c.repo2 === 'grml-stable');
+
+              if (repoStatus[`grml-${version}`]?.status === 'EXISTS' &&
+                  repoStatus['grml-testing']?.status === 'EXISTS' &&
+                  repoStatus['grml-stable']?.status === 'EXISTS') {
+
+                if (versionTestingMatch?.status === 'MATCH' && versionStableMatch?.status === 'MATCH') {
+                  comment += `✅ **PASS**: grml-${version} matches both grml-testing and grml-stable (${repoStatus[`grml-${version}`].packages} packages each)\n`;
+                } else {
+                  if (versionTestingMatch?.status !== 'MATCH') {
+                    comment += `❌ **FAIL**: grml-${version} does not match grml-testing\n`;
+                    
+                    // Add detailed package differences table if available
+                    if (versionTestingMatch?.packageDiffs && versionTestingMatch.packageDiffs.length > 0) {
+                      comment += `\n**Package Differences:**\n`;
+                      comment += `| Package | Architecture | grml-${version} Version | grml-testing Version |\n`;
+                      comment += `|---------|--------------|------------------------|---------------------|\n`;
+                      
+                      for (const diff of versionTestingMatch.packageDiffs.slice(0, 20)) { // Limit to 20 entries
+                        const pkg = diff.package;
+                        const arch = diff.arch;
+                        const ver1 = diff.version1 === 'MISSING' ? '❌ Missing' : diff.version1;
+                        const ver2 = diff.version2 === 'MISSING' ? '❌ Missing' : diff.version2;
+                        comment += `| ${pkg} | ${arch} | ${ver1} | ${ver2} |\n`;
+                      }
+                      
+                      if (versionTestingMatch.packageDiffs.length > 20) {
+                        comment += `\n*... and ${versionTestingMatch.packageDiffs.length - 20} more differences*\n`;
+                      }
+                      comment += `\n`;
+                    } else if (versionTestingMatch?.details && !versionTestingMatch.details.startsWith('DETAILS:')) {
+                      comment += `(${versionTestingMatch.details.replace(/_/g, ' ')})\n`;
+                    }
+                    
+                    allPassed = false;
+                    issues.push(`grml-${version} and grml-testing have different package contents`);
+                  }
+                  if (versionStableMatch?.status !== 'MATCH') {
+                    comment += `❌ **FAIL**: grml-${version} does not match grml-stable\n`;
+                    
+                    // Add detailed package differences table if available
+                    if (versionStableMatch?.packageDiffs && versionStableMatch.packageDiffs.length > 0) {
+                      comment += `\n**Package Differences:**\n`;
+                      comment += `| Package | Architecture | grml-${version} Version | grml-stable Version |\n`;
+                      comment += `|---------|--------------|------------------------|--------------------|\n`;
+                      
+                      for (const diff of versionStableMatch.packageDiffs.slice(0, 20)) { // Limit to 20 entries
+                        const pkg = diff.package;
+                        const arch = diff.arch;
+                        const ver1 = diff.version1 === 'MISSING' ? '❌ Missing' : diff.version1;
+                        const ver2 = diff.version2 === 'MISSING' ? '❌ Missing' : diff.version2;
+                        comment += `| ${pkg} | ${arch} | ${ver1} | ${ver2} |\n`;
+                      }
+                      
+                      if (versionStableMatch.packageDiffs.length > 20) {
+                        comment += `\n*... and ${versionStableMatch.packageDiffs.length - 20} more differences*\n`;
+                      }
+                      comment += `\n`;
+                    } else if (versionStableMatch?.details && !versionStableMatch.details.startsWith('DETAILS:')) {
+                      comment += `(${versionStableMatch.details.replace(/_/g, ' ')})\n`;
+                    }
+                    
+                    allPassed = false;
+                    issues.push(`grml-${version} and grml-stable have different package contents`);
+                  }
+                }
+              } else {
+                if (repoStatus[`grml-${version}`]?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-${version} repository does not exist\n`;
+                  allPassed = false;
+                  issues.push(`grml-${version} repository is missing`);
+                }
+                if (repoStatus['grml-testing']?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-testing repository does not exist\n`;
+                  allPassed = false;
+                  issues.push('grml-testing repository is missing');
+                }
+                if (repoStatus['grml-stable']?.status !== 'EXISTS') {
+                  comment += `❌ **FAIL**: grml-stable repository does not exist\n`;
+                  allPassed = false;
+                  issues.push('grml-stable repository is missing');
+                }
+              }
+
+              // Check 4: grml-<previous-version>-updates should exist
+              comment += `\n### 4. grml-${prevVersion}-updates repository\n`;
+              if (repoStatus[`grml-${prevVersion}-updates`]?.status === 'EXISTS') {
+                comment += `✅ **PASS**: grml-${prevVersion}-updates repository exists (${repoStatus[`grml-${prevVersion}-updates`].packages} packages)\n`;
+              } else {
+                comment += `❌ **FAIL**: grml-${prevVersion}-updates repository does not exist\n`;
+                allPassed = false;
+                issues.push(`grml-${prevVersion}-updates repository is missing`);
+              }
+
+              // Summary
+              comment += `\n### Summary\n`;
+              if (allPassed) {
+                comment += `🎉 **All checks passed!** Release ${version} repositories are properly configured.\n`;
+              } else {
+                comment += `⚠️ **${issues.length} issue(s) found:**\n`;
+                for (const issue of issues) {
+                  comment += `- ${issue}\n`;
+                }
+              }
+            }
+
+            comment += `\n---\n*Check triggered by @${context.actor} • [Workflow run](${context.payload.repository.html_url}/actions/runs/${context.runId})*`;
+
+            // Update the initial comment
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: '${{ steps.initial-comment.outputs.comment_id }}',
+              body: comment
+            });
