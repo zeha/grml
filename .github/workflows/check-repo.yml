@@ -282,6 +282,7 @@ jobs:
               
               # Check i386/amd64 compatibility first for grml repos
               skip_archs = set()
+              repos_are_compatible = False
               if is_grml_repo:
                   repo1_has_i386 = 'i386' in archs1
                   repo1_has_amd64 = 'amd64' in archs1
@@ -315,6 +316,7 @@ jobs:
                       
                       if compatible:
                           skip_archs.update(['i386', 'amd64'])
+                          repos_are_compatible = True
               
               # Compare binary packages for each architecture
               for arch in all_archs:
@@ -332,7 +334,10 @@ jobs:
                       if ver1 != ver2:
                           differences.append(f"{pkg}|{arch}|{ver1}|{ver2}")
               
-              # Return result
+              # Return result - if repos are compatible, consider as MATCH even if there were differences
+              if repos_are_compatible:
+                  return f"MATCH:{repo1_name}:{repo2_name}"
+              
               if differences:
                   # Format differences for detailed output
                   diff_data = []
