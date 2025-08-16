@@ -190,7 +190,8 @@ jobs:
                   
                   arch_packages = count_packages(packages_content)
                   total_packages += arch_packages
-                  arch_details.append(f"{arch}:{arch_packages}")
+                  if arch_packages > 0:  # Only include architectures that have packages
+                      arch_details.append(f"{arch}:{arch_packages}")
               
               architectures_str = ','.join(architectures) if architectures else 'none'
               arch_details_str = ','.join(arch_details) if arch_details else 'none'
@@ -264,8 +265,9 @@ jobs:
               # If sources differ, check if we should continue (for i386/amd64 compatibility)
               sources_differ = len([d for d in differences if d.endswith('source')]) > 0
               
-              # Special handling for grml-stable and grml-testing: allow i386 to match amd64
-              is_stable_testing = ('grml-stable' in [repo1_name, repo2_name] or 'grml-testing' in [repo1_name, repo2_name])
+              # Special handling for grml repos: allow i386 to match amd64
+              # This applies to grml-stable, grml-testing, and versioned repos like grml-2025.08
+              is_grml_repo = any(name.startswith('grml-') for name in [repo1_name, repo2_name])
               
               def get_binary_packages_detailed(base_url, arch):
                   content = fetch_url(f"{base_url}/main/binary-{arch}/Packages.gz")
@@ -278,9 +280,9 @@ jobs:
                       content = fetch_url(f"{base_url}/main/binary-{arch}/Packages")
                   return get_package_details(content)
               
-              # Check i386/amd64 compatibility first for stable/testing repos
+              # Check i386/amd64 compatibility first for grml repos
               skip_archs = set()
-              if is_stable_testing:
+              if is_grml_repo:
                   repo1_has_i386 = 'i386' in archs1
                   repo1_has_amd64 = 'amd64' in archs1
                   repo2_has_i386 = 'i386' in archs2
@@ -416,7 +418,7 @@ jobs:
             function addRepoArchInfo(repo) {
               if (!repo) return '';
               let info = `**Architectures checked**: ${repo.architectures}\n`;
-              if (repo.archDetails !== 'none') {
+              if (repo.archDetails !== 'none' && repo.archDetails !== '') {
                 info += `**Per-architecture packages**: ${repo.archDetails}\n`;
               }
               return info;
